@@ -1,0 +1,839 @@
+# Sonoff Dual R3 v1 (CSE7761)
+# Кофеварка: реле всегда ON после старта (управление из HA), физ. кнопок нет
+# S2 — кнопка кофемолки: по времени ИЛИ по весу с Gaggiuino
+#
+# Подставьте IP/hostname Gaggiuino ниже.
+# Целевой вес помола: recipe.coffeeIn (dose), не globalStopConditions.weight.
+# Остановка по весу: прирост на весах от момента старта (можно не тарить до 0).
+# Futula Scale: переключатель «Futula Scale». Пока он включён, вес берётся с весов,
+# доза по-прежнему из профиля Gaggiuino. Телефон к весам в этот момент не подключать.
+
+substitutions:
+  name: coffee
+  grind_default_s: "15"
+  gaggiuino_host: "192.168.5.14"
+  futula_mac: "CA:E9:05:15:07:FD"
+  # аварийный таймаут помола по весу
+  grind_weight_max_s: "90"
+  # выключить кофеварку, если столько времени ничего не делали
+  coffee_idle_off: 3h
+
+esphome:
+  name: ${name}
+  friendly_name: Coffee
+  on_boot:
+    - priority: -100
+      then:
+        - script.execute: coffee_idle_timer
+        # переключатель Futula восстанавливается без on_turn_on — поиск весов запускаем сами
+        - script.execute: futula_scan_later
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    advanced:
+      # чип rev3.1 + flash GigaDevice — убирает предупреждения в логе
+      minimum_chip_revision: "3.1"
+      flash_chip: gd
+      # загрузчик уже обновлён и поддерживает +40KB IRAM
+      sram1_as_iram: true
+
+logger:
+  baud_rate: 0
+  logs:
+    # опрос FFF4 у Futula всегда даёт "Error reading char ... status=2"
+    ble_sensor: ERROR
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+web_server:
+  port: 80
+  ota: false
+  auth:
+    type: digest
+    username: !secret web_server_username
+    password: !secret web_server_password
+
+ota:
+  - platform: esphome
+    # Нужно для OTA-миграции partition table (у Dual R3 нет удобного USB)
+    allow_partition_access: true
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  # далеко от роутера / нестабильный линк до Gaggiuino
+  power_save_mode: none
+  ap:
+    ssid: "${name} Fallback Hotspot"
+    password: !secret web_server_password
+
+captive_portal:
+
+http_request:
+  # DNS/mDNS до недоступного хоста долго блокирует loop — поднимаем WDT на время запроса
+  timeout: 3s
+  watchdog_timeout: 30s
+  verify_ssl: false
+  # статус ~1 КБ, полный профиль с фазами легко больше 4 КБ
+  buffer_size_rx: 8192
+
+json:
+
+esp32_ble_tracker:
+  scan_parameters:
+    # скан только пока Futula включена и ещё не подключена, иначе Wi-Fi проседает
+    continuous: false
+    duration: 15s
+    active: true
+  on_scan_end:
+    - script.execute: futula_scan_later
+
+ble_client:
+  - mac_address: ${futula_mac}
+    id: futula_scale
+    # адресный тип берётся из объявления; прямой connect после ребута его не знает
+    auto_connect: true
+    on_connect:
+      then:
+        - binary_sensor.template.publish:
+            id: futula_connected
+            state: ON
+        - logger.log: "Futula connected"
+    on_disconnect:
+      then:
+        - binary_sensor.template.publish:
+            id: futula_connected
+            state: OFF
+        - logger.log: "Futula disconnected, will scan again"
+        - script.execute: futula_scan_now
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time:
+      # сброс месячного счётчика 1-го числа в 00:00
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        days_of_month: 1
+        then:
+          - sensor.integration.reset: energy_month
+
+uart:
+  tx_pin: GPIO25
+  rx_pin: GPIO26
+  baud_rate: 38400
+  parity: EVEN
+  stop_bits: 1
+
+globals:
+  - id: grind_start_weight
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: grind_target_g
+    type: float
+    restore_value: false
+    initial_value: "18"
+  - id: gaggiuino_profile_id
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: gaggiuino_profile_id_fetched
+    type: int
+    restore_value: false
+    initial_value: "-1"
+  # защита от script.stop внутри on_turn_off во время штатного выключения скриптом
+  - id: grind_stopping
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # таймер простоя сам выключает реле — не останавливать скрипт из on_turn_off
+  - id: coffee_idle_firing
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: need_profile_fetch
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+number:
+  - platform: template
+    name: Grind Time
+    id: grind_seconds
+    icon: mdi:timer-outline
+    unit_of_measurement: s
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: ${grind_default_s}
+    min_value: 0.1
+    max_value: 120
+    step: 0.1
+    mode: box
+
+  # Если > 0 — перекрывает вес из профиля Gaggiuino
+  - platform: template
+    name: Grind Target Override
+    id: grind_target_override
+    icon: mdi:weight-gram
+    unit_of_measurement: g
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 50
+    step: 0.1
+    mode: box
+
+  # На сколько граммов раньше цели выключить мотор: зёрна ещё падают после реле
+  - platform: template
+    name: Grind Stop Early
+    id: grind_stop_early
+    icon: mdi:arrow-collapse-up
+    unit_of_measurement: g
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 1.0
+    min_value: 0
+    max_value: 5
+    step: 0.1
+    mode: box
+
+button:
+  - platform: restart
+    name: Restart
+    entity_category: diagnostic
+
+  - platform: template
+    name: Grinder Button
+    icon: mdi:gesture-tap-button
+    on_press:
+      - script.execute: grind_button
+
+light:
+  - platform: status_led
+    name: Status LED
+    id: led_status
+    entity_category: diagnostic
+    pin:
+      number: GPIO13
+      inverted: true
+
+text_sensor:
+  - platform: template
+    name: Gaggiuino Profile
+    id: gaggiuino_profile_name
+    icon: mdi:coffee-maker-outline
+    update_interval: never
+
+sensor:
+  - platform: cse7761
+    update_interval: 21s
+    voltage:
+      name: Voltage
+    current_1:
+      name: Current Coffee Maker
+      disabled_by_default: true
+    current_2:
+      name: Current Grinder
+      disabled_by_default: true
+    active_power_1:
+      name: Power Coffee Maker
+      id: power_coffee
+      # Dual R3 v1: шунт подключён наоборот, нагрузка приходит со знаком минус
+      filters:
+        - multiply: -1
+      on_value:
+        - component.update: power_total
+    active_power_2:
+      name: Power Grinder
+      id: power_grinder
+      filters:
+        - multiply: -1
+      on_value:
+        - component.update: power_total
+
+  - platform: template
+    name: Total Power
+    id: power_total
+    icon: mdi:flash
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    lambda: |-
+      float a = id(power_coffee).has_state() ? id(power_coffee).state : 0.0f;
+      float b = id(power_grinder).has_state() ? id(power_grinder).state : 0.0f;
+      return a + b;
+
+  - platform: total_daily_energy
+    name: Energy Today
+    power_id: power_total
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+
+  - platform: integration
+    name: Energy This Month
+    id: energy_month
+    sensor: power_total
+    time_unit: h
+    restore: true
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+
+  - platform: template
+    name: Scale Weight
+    id: scale_weight
+    icon: mdi:scale
+    unit_of_measurement: g
+    device_class: weight
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: ble_client
+    ble_client_id: futula_scale
+    type: characteristic
+    # тот же вес публикуется в Scale Weight; в HA отдельно не показываем
+    internal: true
+    id: futula_weight
+    service_uuid: "0000fff0-0000-1000-8000-00805f9b34fb"
+    characteristic_uuid: "0000fff4-0000-1000-8000-00805f9b34fb"
+    notify: true
+    # С update_interval: never вес переставал приходить. Опрос возвращает
+    # status=2 (FFF4 не читается), эта ошибка скрыта в logger.
+    update_interval: 60s
+    unit_of_measurement: g
+    device_class: weight
+    accuracy_decimals: 1
+    lambda: |-
+      if (x.size() < 6)
+        return NAN;
+      uint16_t raw = (uint16_t) x[3] | ((uint16_t) x[4] << 8);
+      float grams = raw / 10.0f;
+      if (x[5] > 0)
+        grams = -grams;
+      if (id(use_futula).state)
+        id(scale_weight).publish_state(grams);
+      return grams;
+
+  - platform: template
+    name: Profile Dose
+    id: profile_target_weight
+    icon: mdi:target
+    unit_of_measurement: g
+    device_class: weight
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: wifi_signal
+    name: WiFi Signal
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: Uptime
+    update_interval: 300s
+    entity_category: diagnostic
+
+switch:
+  - platform: gpio
+    name: Coffee Maker
+    id: relay_coffee
+    icon: mdi:coffee-maker
+    pin: GPIO27
+    restore_mode: ALWAYS_ON
+    on_turn_on:
+      - script.execute: coffee_idle_timer
+      - if:
+          condition:
+            or:
+              - switch.is_on: grind_by_weight
+              - switch.is_on: use_futula
+          then:
+            - lambda: id(need_profile_fetch) = true;
+            - script.execute: gaggiuino_fetch_status
+    on_turn_off:
+      - if:
+          condition:
+            lambda: return !id(coffee_idle_firing);
+          then:
+            - script.stop: coffee_idle_timer
+      - script.stop: gaggiuino_fetch_status
+      - script.stop: gaggiuino_fetch_status_run
+      - script.stop: gaggiuino_fetch_profile_target
+      - lambda: id(need_profile_fetch) = false;
+      # помол по весу только пока кофеварка включена
+      - switch.turn_off: grind_by_weight
+      - if:
+          condition:
+            script.is_running: grind_weight
+          then:
+            - script.execute: grind_cancel
+
+  - platform: gpio
+    name: Grinder
+    id: relay_grinder
+    icon: mdi:coffee
+    pin: GPIO14
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      # помол — активность, отсчёт 3 часов заново
+      - script.execute: coffee_idle_timer
+    # Только стоп скриптов (без повторного turn_off) — иначе re-entrant crash
+    on_turn_off:
+      - if:
+          condition:
+            lambda: return !id(grind_stopping);
+          then:
+            - script.stop: grind_time
+            - script.stop: grind_weight
+            - script.stop: grind_weight_watchdog
+            - script.stop: grind_prepare_target
+
+  # ON = вес и остановка помола по Gaggiuino, OFF = помол по таймеру
+  - platform: template
+    name: Gaggiuino Scale
+    id: grind_by_weight
+    icon: mdi:weight
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - if:
+          condition:
+            switch.is_off: relay_coffee
+          then:
+            - switch.turn_off: grind_by_weight
+          else:
+            # один раз подтянуть dose; фоновый опрос только пока режим веса включён
+            - lambda: id(need_profile_fetch) = true;
+            - script.execute: gaggiuino_fetch_status
+
+  # ON = вес с Futula по BLE, OFF = вес из Gaggiuino
+  - platform: template
+    name: Futula Scale
+    id: use_futula
+    icon: mdi:scale-bathroom
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      # доза с Gaggiuino только пока кофеварка включена; вес Futula идёт и без неё
+      - if:
+          condition:
+            switch.is_on: relay_coffee
+          then:
+            - lambda: id(need_profile_fetch) = true;
+            - script.execute: gaggiuino_fetch_status
+      - script.execute: futula_scan_now
+    on_turn_off:
+      - script.stop: futula_scan_now
+      - script.stop: futula_scan_later
+      - esp32_ble_tracker.stop_scan:
+      - ble_client.disconnect: futula_scale
+
+script:
+  - id: coffee_idle_timer
+    mode: restart
+    then:
+      - delay: ${coffee_idle_off}
+      - if:
+          condition:
+            switch.is_on: relay_coffee
+          then:
+            - logger.log: "Coffee maker idle for ${coffee_idle_off}, turning off"
+            - lambda: id(coffee_idle_firing) = true;
+            - switch.turn_off: relay_coffee
+            - lambda: id(coffee_idle_firing) = false;
+
+  - id: grind_cancel
+    mode: single
+    then:
+      - lambda: id(grind_stopping) = true;
+      - script.stop: grind_time
+      - script.stop: grind_weight
+      - script.stop: grind_weight_watchdog
+      - script.stop: grind_prepare_target
+      - script.stop: gaggiuino_fetch_status
+      - script.stop: gaggiuino_fetch_status_run
+      - script.stop: gaggiuino_fetch_profile_target
+      - switch.turn_off: relay_grinder
+      - lambda: id(grind_stopping) = false;
+
+  # Пока «Futula Scale» включена, ищем весы пачками по 15 с.
+  # on_turn_on после перезагрузки не вызывается, поэтому тот же скрипт стартует с on_boot.
+  - id: futula_scan_now
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: use_futula
+              - binary_sensor.is_off: futula_connected
+          then:
+            - logger.log: "Futula: scanning"
+            - esp32_ble_tracker.start_scan:
+
+  - id: futula_scan_later
+    mode: restart
+    then:
+      - delay: 4s
+      - script.execute: futula_scan_now
+
+  - id: gaggiuino_fetch_status
+    mode: single
+    then:
+      - if:
+          condition:
+            switch.is_on: relay_coffee
+          then:
+            - script.execute: gaggiuino_fetch_status_run
+            - script.wait: gaggiuino_fetch_status_run
+
+  - id: gaggiuino_fetch_status_run
+    mode: single
+    then:
+      - http_request.get:
+          url: http://${gaggiuino_host}/api/system/status
+          capture_response: true
+          max_response_buffer_size: 4096
+          on_response:
+            then:
+              - if:
+                  condition:
+                    lambda: return response->status_code == 200;
+                  then:
+                    - lambda: |-
+                        JsonDocument doc;
+                        DeserializationError err = deserializeJson(doc, body);
+                        if (err || doc.isNull()) {
+                          ESP_LOGW("gaggiuino", "status parse failed: %s len=%u", err.c_str(),
+                                   (unsigned) body.size());
+                          return;
+                        }
+                        JsonObject obj = doc.is<JsonArray>() ? doc[0].as<JsonObject>() : doc.as<JsonObject>();
+                        float w = NAN;
+                        if (!obj["weight"].isNull()) {
+                          if (obj["weight"].is<const char *>())
+                            w = strtof(obj["weight"].as<const char *>(), nullptr);
+                          else
+                            w = obj["weight"].as<float>();
+                        }
+                        if (!isnan(w) && !id(use_futula).state)
+                          id(scale_weight).publish_state(w);
+                        // profileId бывает и числом, и строкой "7".
+                        // is<const char*>() для строки из JSON часто false, as<int>() тогда даёт 0.
+                        int pid = 0;
+                        JsonVariant pidv = obj["profileId"];
+                        if (!pidv.isNull()) {
+                          if (pidv.is<int>() || pidv.is<float>())
+                            pid = pidv.as<int>();
+                          const char *pids = pidv.as<const char *>();
+                          if (pid <= 0 && pids != nullptr && *pids != '\0')
+                            pid = atoi(pids);
+                        }
+                        if (pid > 0) {
+                          if (pid != id(gaggiuino_profile_id) || !id(profile_target_weight).has_state())
+                            id(need_profile_fetch) = true;
+                          id(gaggiuino_profile_id) = pid;
+                        } else {
+                          const char *raw = obj["profileId"].as<const char *>();
+                          ESP_LOGW("gaggiuino", "profileId unparsed: %s", raw != nullptr ? raw : "(null)");
+                        }
+                        if (!obj["profileName"].isNull()) {
+                          id(gaggiuino_profile_name).publish_state(obj["profileName"].as<std::string>());
+                        }
+                  else:
+                    - logger.log:
+                        level: WARN
+                        format: "Gaggiuino status HTTP %d"
+                        args: ["response->status_code"]
+          on_error:
+            then:
+              - logger.log:
+                  level: WARN
+                  format: "Gaggiuino status unreachable (${gaggiuino_host})"
+      # профиль только после того, как статус уже записал id
+      - if:
+          condition:
+            lambda: return id(need_profile_fetch) && id(gaggiuino_profile_id) > 0;
+          then:
+            - script.execute: gaggiuino_fetch_profile_target
+
+  - id: gaggiuino_fetch_profile_target
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: relay_coffee
+              - lambda: return id(gaggiuino_profile_id) > 0;
+          then:
+            - http_request.get:
+                url: !lambda |-
+                  return str_sprintf("http://${gaggiuino_host}/api/profile/%d", id(gaggiuino_profile_id));
+                capture_response: true
+                max_response_buffer_size: 16384
+                on_response:
+                  then:
+                    - if:
+                        condition:
+                          lambda: return response->status_code == 200;
+                        then:
+                          - lambda: |-
+                              JsonDocument doc;
+                              DeserializationError err = deserializeJson(doc, body);
+                              if (err) {
+                                // не сбрасываем need_profile_fetch — интервал повторит запрос
+                                ESP_LOGW("gaggiuino", "profile parse failed: %s len=%u", err.c_str(),
+                                         (unsigned) body.size());
+                                return;
+                              }
+                              id(need_profile_fetch) = false;
+                              id(gaggiuino_profile_id_fetched) = id(gaggiuino_profile_id);
+                              JsonObject root = doc.is<JsonArray>() && doc.size() > 0
+                                  ? doc[0].as<JsonObject>()
+                                  : doc.as<JsonObject>();
+                              auto as_float = [](JsonVariant v) -> float {
+                                if (v.isNull()) return NAN;
+                                if (v.is<const char *>()) {
+                                  const char *s = v.as<const char *>();
+                                  if (s == nullptr || *s == '\0') return NAN;
+                                  return strtof(s, nullptr);
+                                }
+                                return v.as<float>();
+                              };
+                              float target = NAN;
+                              if (root["recipe"].is<JsonObject>()) {
+                                JsonObject recipe = root["recipe"].as<JsonObject>();
+                                std::string recipe_dump;
+                                serializeJson(recipe, recipe_dump);
+                                ESP_LOGI("gaggiuino", "recipe=%s", recipe_dump.c_str());
+                                target = as_float(recipe["coffeeIn"]);
+                                if (isnan(target) || target <= 0.0f) target = as_float(recipe["dose"]);
+                                if (isnan(target) || target <= 0.0f) target = as_float(recipe["coffee"]);
+                                if (isnan(target) || target <= 0.0f) target = as_float(recipe["in"]);
+                              } else {
+                                ESP_LOGW("gaggiuino", "no recipe object in profile");
+                              }
+                              if (!isnan(target) && target > 0.0f) {
+                                id(profile_target_weight).publish_state(target);
+                                id(grind_target_g) = target;
+                                ESP_LOGI("gaggiuino", "dose=%.2fg", target);
+                              } else {
+                                ESP_LOGW("gaggiuino", "empty dose — set coffeeIn in Gaggiuino recipe");
+                              }
+                        else:
+                          - logger.log:
+                              level: WARN
+                              format: "Gaggiuino profile HTTP %d"
+                              args: [response->status_code]
+                on_error:
+                  then:
+                    - logger.log:
+                        level: WARN
+                        format: "Gaggiuino profile unreachable"
+          else:
+            - if:
+                condition:
+                  switch.is_on: relay_coffee
+                then:
+                  - logger.log:
+                      level: WARN
+                      format: "Skip profile fetch, profileId=%d"
+                      args: ["id(gaggiuino_profile_id)"]
+
+  - id: grind_prepare_target
+    mode: single
+    then:
+      - script.execute: gaggiuino_fetch_status
+      - delay: 50ms
+      - script.wait: gaggiuino_fetch_status
+      - delay: 100ms
+      - if:
+          condition:
+            or:
+              - lambda: return id(need_profile_fetch);
+              - lambda: return id(gaggiuino_profile_id_fetched) != id(gaggiuino_profile_id);
+          then:
+            - script.execute: gaggiuino_fetch_profile_target
+            - delay: 50ms
+            - script.wait: gaggiuino_fetch_profile_target
+            - delay: 100ms
+      - lambda: |-
+          float ov = id(grind_target_override).state;
+          if (ov > 0.0f) {
+            id(grind_target_g) = ov;
+            id(profile_target_weight).publish_state(ov);
+          }
+          ESP_LOGI("grind", "target=%.2fg scale=%.2fg", id(grind_target_g), id(scale_weight).state);
+
+  - id: grind_time
+    mode: restart
+    then:
+      - switch.turn_on: relay_grinder
+      - delay: !lambda "return roundf(id(grind_seconds).state * 1000.0f);"
+      - if:
+          condition:
+            lambda: return !id(grind_stopping);
+          then:
+            - switch.turn_off: relay_grinder
+
+  - id: grind_weight
+    mode: restart
+    then:
+      - script.execute: grind_prepare_target
+      - script.wait: grind_prepare_target
+      - if:
+          condition:
+            lambda: |-
+              if (!(id(grind_target_g) > 0.0f) || isnan(id(grind_target_g)))
+                return false;
+              if (id(use_futula).state && !id(futula_weight).has_state())
+                return false;
+              return true;
+          then:
+            - lambda: |-
+                id(grind_start_weight) = id(scale_weight).has_state() ? id(scale_weight).state : 0.0f;
+                ESP_LOGI("grind", "start_weight=%.2f target=%.2f stop_early=%.2f",
+                         id(grind_start_weight), id(grind_target_g), id(grind_stop_early).state);
+            - switch.turn_on: relay_grinder
+            - while:
+                condition:
+                  and:
+                    - switch.is_on: relay_grinder
+                    - lambda: |-
+                        float early = id(grind_stop_early).state;
+                        if (isnan(early) || early < 0.0f)
+                          early = 0.0f;
+                        return !id(grind_stopping) &&
+                               (id(scale_weight).state - id(grind_start_weight)) <
+                               (id(grind_target_g) - early);
+                then:
+                  - if:
+                      condition:
+                        switch.is_on: use_futula
+                      then:
+                        - delay: 50ms
+                      else:
+                        - script.execute: gaggiuino_fetch_status
+                        - delay: 50ms
+                        - script.wait: gaggiuino_fetch_status
+                        - delay: 400ms
+            - if:
+                condition:
+                  lambda: return !id(grind_stopping);
+                then:
+                  - switch.turn_off: relay_grinder
+                  - logger.log:
+                      format: "Grind stopped by weight (delta=%.2f)"
+                      args: ["id(scale_weight).state - id(grind_start_weight)"]
+          else:
+            - logger.log: "No grind target weight — abort"
+
+  - id: grind_weight_watchdog
+    mode: restart
+    then:
+      - delay: ${grind_weight_max_s}s
+      - if:
+          condition:
+            switch.is_on: relay_grinder
+          then:
+            - logger.log: "Grind watchdog timeout"
+            - script.execute: grind_cancel
+
+  # Физическая кнопка и кнопка в HA
+  - id: grind_button
+    mode: restart
+    then:
+      - script.execute: coffee_idle_timer
+      - if:
+          condition:
+            or:
+              - switch.is_on: relay_grinder
+              - script.is_running: grind_time
+              - script.is_running: grind_weight
+          then:
+            - script.execute: grind_cancel
+          else:
+            - if:
+                condition:
+                  and:
+                    - switch.is_on: relay_coffee
+                    - or:
+                        - switch.is_on: grind_by_weight
+                        - switch.is_on: use_futula
+                then:
+                  - script.execute: grind_weight
+                  - script.execute: grind_weight_watchdog
+                else:
+                  - script.execute: grind_time
+
+interval:
+  # HTTP только если нужен режим веса — иначе mDNS к мёртвому хосту роняет Task WDT
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: relay_coffee
+              - or:
+                  - switch.is_on: grind_by_weight
+                  - switch.is_on: use_futula
+              - not:
+                  script.is_running: grind_weight
+              - not:
+                  script.is_running: grind_prepare_target
+              - not:
+                  script.is_running: gaggiuino_fetch_status
+              - not:
+                  script.is_running: gaggiuino_fetch_status_run
+              - not:
+                  script.is_running: gaggiuino_fetch_profile_target
+          then:
+            - if:
+                condition:
+                  lambda: return id(need_profile_fetch) && id(gaggiuino_profile_id) > 0;
+                then:
+                  - script.execute: gaggiuino_fetch_profile_target
+                else:
+                  - script.execute: gaggiuino_fetch_status
+
+binary_sensor:
+  - platform: template
+    id: futula_connected
+    name: Futula Connected
+    device_class: connectivity
+    entity_category: diagnostic
+
+  # S2 — кнопка кофемолки
+  - platform: gpio
+    name: Button Grinder
+    id: btn_grinder
+    pin:
+      number: GPIO33
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      - script.execute: grind_button
