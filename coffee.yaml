@@ -136,6 +136,28 @@ globals:
     type: float
     restore_value: false
     initial_value: "0"
+  # секунды, которые кофе ещё падает после выключения мотора; подстраивается после помола
+  - id: grind_lead_s
+    type: float
+    restore_value: true
+    initial_value: "0.5"
+  # последний устойчивый поток, г/с
+  - id: grind_rate_gps
+    type: float
+    restore_value: true
+    initial_value: "0"
+  - id: grind_prev_g
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: grind_prev_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: grind_cutoff_g
+    type: float
+    restore_value: false
+    initial_value: "0"
   - id: grind_target_g
     type: float
     restore_value: false
@@ -193,7 +215,7 @@ number:
     step: 0.1
     mode: box
 
-  # На сколько граммов раньше цели выключить мотор: зёрна ещё падают после реле
+  # Граммы упреждения на последнем измеренном потоке. После помола пересчитывается само.
   - platform: template
     name: Grind Stop Early
     id: grind_stop_early
@@ -207,6 +229,14 @@ number:
     max_value: 5
     step: 0.1
     mode: box
+    on_value:
+      - lambda: |-
+          if (id(grind_rate_gps) < 0.4f)
+            return;
+          float lead = x / id(grind_rate_gps);
+          if (lead < 0.15f) lead = 0.15f;
+          if (lead > 2.0f) lead = 2.0f;
+          id(grind_lead_s) = lead;
 
 button:
   - platform: restart
@@ -712,8 +742,11 @@ script:
           then:
             - lambda: |-
                 id(grind_start_weight) = id(scale_weight).has_state() ? id(scale_weight).state : 0.0f;
-                ESP_LOGI("grind", "start_weight=%.2f target=%.2f stop_early=%.2f",
-                         id(grind_start_weight), id(grind_target_g), id(grind_stop_early).state);
+                id(grind_prev_g) = 0.0f;
+                id(grind_prev_ms) = millis();
+                ESP_LOGI("grind", "start_weight=%.2f target=%.2f lead=%.2fs early=%.2fg",
+                         id(grind_start_weight), id(grind_target_g), id(grind_lead_s),
+                         id(grind_stop_early).state);
             - switch.turn_on: relay_grinder
             - while:
                 condition:
@@ -723,9 +756,17 @@ script:
                         float early = id(grind_stop_early).state;
                         if (isnan(early) || early < 0.0f)
                           early = 0.0f;
-                        return !id(grind_stopping) &&
-                               (id(scale_weight).state - id(grind_start_weight)) <
-                               (id(grind_target_g) - early);
+                        float rate = id(grind_rate_gps);
+                        float lead = id(grind_lead_s);
+                        if (isnan(lead) || lead < 0.15f)
+                          lead = 0.15f;
+                        // пока поток ещё не измерен, держим прошлый запас в граммах
+                        if (rate >= 0.4f)
+                          early = rate * lead;
+                        if (early > 5.0f)
+                          early = 5.0f;
+                        float delta = id(scale_weight).state - id(grind_start_weight);
+                        return !id(grind_stopping) && delta < (id(grind_target_g) - early);
                 then:
                   - if:
                       condition:
@@ -737,14 +778,66 @@ script:
                         - delay: 50ms
                         - script.wait: gaggiuino_fetch_status
                         - delay: 400ms
+                  - lambda: |-
+                      float delta = id(scale_weight).state - id(grind_start_weight);
+                      uint32_t now = millis();
+                      if (id(grind_prev_ms) != 0 && delta > 1.0f) {
+                        float dt = (now - id(grind_prev_ms)) / 1000.0f;
+                        if (dt >= 0.05f && dt <= 2.0f) {
+                          float inst = (delta - id(grind_prev_g)) / dt;
+                          if (inst >= 0.2f && inst <= 8.0f) {
+                            float r = id(grind_rate_gps);
+                            id(grind_rate_gps) = (r < 0.2f) ? inst : (r * 0.7f + inst * 0.3f);
+                          }
+                        }
+                      }
+                      id(grind_prev_g) = delta;
+                      id(grind_prev_ms) = now;
             - if:
                 condition:
                   lambda: return !id(grind_stopping);
                 then:
+                  - lambda: |-
+                      id(grind_cutoff_g) = id(scale_weight).state - id(grind_start_weight);
                   - switch.turn_off: relay_grinder
                   - logger.log:
-                      format: "Grind stopped by weight (delta=%.2f)"
-                      args: ["id(scale_weight).state - id(grind_start_weight)"]
+                      format: "Grind motor off at %.2fg, flow %.2f g/s, lead %.2fs"
+                      args: ["id(grind_cutoff_g)", "id(grind_rate_gps)", "id(grind_lead_s)"]
+                  # зёрна ещё падают; чашку не снимать, иначе поправка испортится
+                  - delay: 2500ms
+                  - lambda: |-
+                      if (id(grind_stopping))
+                        return;
+                      float settled = id(scale_weight).state - id(grind_start_weight);
+                      float cutoff = id(grind_cutoff_g);
+                      float target = id(grind_target_g);
+                      float rate = id(grind_rate_gps);
+                      if (settled < cutoff - 1.5f) {
+                        ESP_LOGW("grind", "skip lead learn, cup moved settled=%.2f cutoff=%.2f", settled, cutoff);
+                        return;
+                      }
+                      if (!(rate >= 0.4f)) {
+                        ESP_LOGW("grind", "skip lead learn, flow=%.2f g/s", rate);
+                        return;
+                      }
+                      float error = settled - target;
+                      float lead = id(grind_lead_s);
+                      if (isnan(lead) || lead < 0.15f)
+                        lead = 0.5f;
+                      lead = lead + 0.5f * (error / rate);
+                      if (lead < 0.15f) lead = 0.15f;
+                      if (lead > 2.0f) lead = 2.0f;
+                      float grams = lead * rate;
+                      if (grams > 5.0f) {
+                        grams = 5.0f;
+                        lead = grams / rate;
+                      }
+                      id(grind_lead_s) = lead;
+                      ESP_LOGI("grind", "settled=%.2f target=%.2f error=%+.2f flow=%.2f lead=%.2fs early=%.2fg",
+                               settled, target, error, rate, lead, grams);
+                      auto call = id(grind_stop_early).make_call();
+                      call.set_value(grams);
+                      call.perform();
           else:
             - logger.log: "No grind target weight — abort"
 
