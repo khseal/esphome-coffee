@@ -2,7 +2,7 @@
 
 ESPHome-конфиг для Sonoff Dual R3 v1 (ESP32, CSE7761). Кофеварка включается вместе с устройством. Кофемолка запускается кнопкой и останавливается по таймеру или по набранному весу.
 
-Вес берётся либо с Gaggiuino по HTTP, либо с весов Timemore Black Mirror Dot по Bluetooth. Целевая доза читается из профиля Gaggiuino (`recipe.coffeeIn`).
+Вес берётся либо с Gaggiuino по HTTP, либо с весов Timemore Black Mirror Dot по Bluetooth. Целевая доза читается из профиля Gaggiuino (`recipe.coffeeIn`). Пока Timemore подключены, Dual R3 отдаёт их вес в Gaggiuino, притворяясь весами Decent Scale.
 
 ## Поведение
 
@@ -24,8 +24,9 @@ ESPHome-конфиг для Sonoff Dual R3 v1 (ESP32, CSE7761). Кофеварк
 - После сброса весов старый ключ не подходит. Кнопка **Timemore Unpair** забывает сохранённые ключи, следующее подключение сопрягает весы заново.
 - Если переключатель был включён до перезагрузки, контроллер продолжает искать весы.
 - **Timemore Connected** показывает, что связь установлена.
+- Для пролива Dual R3 объявляет себя по Bluetooth как `Decent Scale` и пересылает туда каждый кадр веса Timemore. В Gaggiuino включают Bluetooth-весы и выбирают эти весы. Команда тары с Gaggiuino обнуляет Timemore. Пока Timemore не подключены, Gaggiuino может соединиться, но вес обновляться не будет.
 
-IP Gaggiuino задаётся в начале `coffee.yaml`.
+IP Gaggiuino задаётся в начале `coffee.yaml`. Веб-интерфейса у контроллера нет: управление идёт через Home Assistant. Если Wi-Fi пропадёт, поднимется резервная точка доступа.
 
 ## Железо
 
@@ -41,12 +42,11 @@ IP Gaggiuino задаётся в начале `coffee.yaml`.
 
 ## Секреты
 
-Wi-Fi, пароль веб-интерфейса и ключ API в репозиторий не входят. Рядом с конфигом нужен `secrets.yaml`:
+Wi-Fi, пароль резервной точки доступа и ключ API в репозиторий не входят. Рядом с конфигом нужен `secrets.yaml`:
 
 ```yaml
 wifi_ssid: "..."
 wifi_password: "..."
-web_server_username: "..."
 web_server_password: "..."
 api_encryption_key: "..."
 ```

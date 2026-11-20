@@ -55,14 +55,6 @@ api:
   encryption:
     key: !secret api_encryption_key
 
-web_server:
-  port: 80
-  ota: false
-  auth:
-    type: digest
-    username: !secret web_server_username
-    password: !secret web_server_password
-
 ota:
   - platform: esphome
     # Нужно для OTA-миграции partition table (у Dual R3 нет удобного USB)
@@ -91,9 +83,49 @@ http_request:
 json:
 
 esp32_ble:
+  # Gaggiuino находит весы по имени, начинающемуся с «Decent Scale»
+  name: Decent Scale
   # Dot спаривается Just Works, как приложение Timemore
   io_capability: none
   auth_req_mode: sc_bond
+
+# Для Gaggiuino Dual R3 притворяется Decent Scale и пересылает вес Timemore.
+esp32_ble_server:
+  id: decent_server
+  manufacturer: Decent
+  model: Decent Scale
+  on_connect:
+    - lambda: |-
+        id(decent_client) = true;
+        id(decent_conn) = id;
+        ESP_LOGI("decent", "Gaggiuino connected conn=%u", id);
+  on_disconnect:
+    - lambda: |-
+        id(decent_client) = false;
+        ESP_LOGI("decent", "Gaggiuino disconnected");
+  services:
+    - uuid: FFF0
+      advertise: true
+      characteristics:
+        - id: decent_weight
+          uuid: FFF4
+          read: true
+          notify: true
+          value:
+            data: [0x03, 0xCE, 0x00, 0x00, 0x00, 0x00, 0xCD]
+        # 03 0F … 0C — тара от Gaggiuino, остальные команды Decent не нужны
+        - uuid: 36F5
+          write: true
+          write_no_response: true
+          on_write:
+            - lambda: |-
+                ESP_LOGI("decent", "Gaggiuino command %02X %02X len=%u",
+                         x.size() > 0 ? x[0] : 0, x.size() > 1 ? x[1] : 0, (unsigned) x.size());
+            - if:
+                condition:
+                  lambda: return x.size() >= 2 && x[0] == 0x03 && x[1] == 0x0F;
+                then:
+                  - script.execute: dot_tare
 
 esp32_ble_tracker:
   id: ble_tracker
@@ -259,7 +291,7 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
-  # handle FFF1, снятый в момент подключения, пока кэш GATT ещё жив
+  # handle FFF2 (команды Dot), снятый в момент подключения, пока кэш GATT ещё жив
   - id: dot_tare_handle
     type: uint16_t
     restore_value: false
@@ -282,6 +314,14 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  - id: decent_client
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: decent_conn
+    type: uint16_t
+    restore_value: false
+    initial_value: "0"
   - id: dot_cccd_handle
     type: uint16_t
     restore_value: false
@@ -466,15 +506,23 @@ sensor:
     filters:
       - multiply: 0.001
 
+  # каждый кадр весов для остановки помола; в HA уходит прореженная копия ниже
   - platform: template
-    name: Scale Weight
     id: scale_weight
-    icon: mdi:scale
+    internal: true
     unit_of_measurement: g
     device_class: weight
-    state_class: measurement
     accuracy_decimals: 1
     update_interval: never
+
+  - platform: copy
+    source_id: scale_weight
+    name: Scale Weight
+    icon: mdi:scale
+    state_class: measurement
+    filters:
+      - throttle: 500ms
+      - delta: 0.1
 
   - platform: ble_client
     ble_client_id: dot_scale
@@ -490,6 +538,29 @@ sensor:
     unit_of_measurement: g
     device_class: weight
     accuracy_decimals: 1
+    # тот же вес отдаём Gaggiuino кадром Decent Scale: 03 CE, int16 BE в десятых грамма, 00 00, XOR
+    # Шлём напрямую по соединению: штатный notify ждёт подписку, которую Gaggiuino пишет без ответа.
+    # FFF4 — первая характеристика сервиса, её значение лежит на handle сервиса + 2.
+    on_value:
+      - lambda: |-
+          if (!id(decent_client) || isnan(x))
+            return;
+          long w = lroundf(x * 10.0f);
+          if (w > 32767) w = 32767;
+          if (w < -32768) w = -32768;
+          uint16_t u = (uint16_t) (int16_t) w;
+          uint8_t f[7] = {0x03, 0xCE, (uint8_t) (u >> 8), (uint8_t) (u & 0xFF), 0x00, 0x00, 0x00};
+          for (int i = 0; i < 6; i++)
+            f[6] ^= f[i];
+          id(decent_weight)->set_value(f, sizeof(f));
+          uint16_t handle = id(decent_weight)->get_service()->get_handle() + 2;
+          esp_err_t err = esp_ble_gatts_send_indicate(id(decent_server)->get_gatts_if(), id(decent_conn),
+                                                      handle, sizeof(f), f, false);
+          static uint32_t last_log = 0;
+          if (err != ESP_OK && millis() - last_log > 5000) {
+            last_log = millis();
+            ESP_LOGW("decent", "tx failed err=%d conn=%u handle=%u", (int) err, id(decent_conn), handle);
+          }
     lambda: |-
       static uint8_t buf[40];
       static uint8_t len = 0;
@@ -550,6 +621,9 @@ sensor:
     accuracy_decimals: 2
     entity_category: diagnostic
     update_interval: never
+    # во время помола пересчитывается каждые 50 мс; логика берёт grind_rate_gps
+    filters:
+      - throttle: 1s
 
   - platform: template
     name: Grind Lead
