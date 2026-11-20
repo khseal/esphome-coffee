@@ -5,14 +5,14 @@
 # Подставьте IP/hostname Gaggiuino ниже.
 # Целевой вес помола: recipe.coffeeIn (dose), не globalStopConditions.weight.
 # Остановка по весу: прирост на весах от момента старта (можно не тарить до 0).
-# Futula Scale: переключатель «Futula Scale». Пока он включён, вес берётся с весов,
-# доза по-прежнему из профиля Gaggiuino. Телефон к весам в этот момент не подключать.
+# Timemore Scale: переключатель «Timemore Scale». Пока он включён, вес берётся
+# с Black Mirror Dot (имя TIMEMORE_Dot). Доза по-прежнему из профиля Gaggiuino.
+# Телефон к весам в этот момент не подключать: Dot держит одно соединение.
 
 substitutions:
   name: coffee
   grind_default_s: "15"
   gaggiuino_host: "192.168.5.14"
-  futula_mac: "CA:E9:05:15:07:FD"
   # аварийный таймаут помола по весу
   grind_weight_max_s: "90"
   # выключить кофеварку, если столько времени ничего не делали
@@ -25,8 +25,8 @@ esphome:
     - priority: -100
       then:
         - script.execute: coffee_idle_timer
-        # переключатель Futula восстанавливается без on_turn_on — поиск весов запускаем сами
-        - script.execute: futula_scan_later
+        # переключатель Timemore восстанавливается без on_turn_on — поиск весов запускаем сами
+        - script.execute: dot_scan_later
         - lambda: |-
             id(grind_lead).publish_state(id(grind_lead_s));
             if (id(grind_rate_gps) >= 0.4f)
@@ -48,7 +48,7 @@ esp32:
 logger:
   baud_rate: 0
   logs:
-    # опрос FFF4 у Futula всегда даёт "Error reading char ... status=2"
+    # лишний опрос notify-характеристики Dot пишет status=2, вес идёт уведомлениями
     ble_sensor: ERROR
 
 api:
@@ -90,33 +90,97 @@ http_request:
 
 json:
 
+esp32_ble:
+  # Dot спаривается Just Works, как приложение Timemore
+  io_capability: none
+  auth_req_mode: sc_bond
+
 esp32_ble_tracker:
+  id: ble_tracker
   scan_parameters:
-    # скан только пока Futula включена и ещё не подключена, иначе Wi-Fi проседает
+    # скан только пока Timemore включена и ещё не подключена, иначе Wi-Fi проседает
+    # active: имя TIMEMORE_Dot приходит в scan response
     continuous: false
     duration: 15s
     active: true
   on_scan_end:
-    - script.execute: futula_scan_later
+    - script.execute: dot_scan_later
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            if (!id(use_dot).state || id(dot_connecting) || id(dot_scale).connected())
+              return;
+            std::string name(x.get_name().c_str());
+            if (name.find("TIMEMORE_Dot") == std::string::npos)
+              return;
+            char addr[32];
+            ESP_LOGI("scale", "Timemore %s", x.address_str_to(addr));
+            id(dot_scale).set_address(x.address_uint64());
+            id(dot_scale).set_remote_addr_type(x.get_address_type());
+            id(dot_connecting) = true;
+            id(ble_tracker).stop_scan();
+            id(dot_scale).connect();
 
 ble_client:
-  - mac_address: ${futula_mac}
-    id: futula_scale
-    # адресный тип берётся из объявления; прямой connect после ребута его не знает
-    auto_connect: true
+  - mac_address: "00:00:00:00:00:00"
+    id: dot_scale
+    # адрес подставляется из объявления TIMEMORE_Dot
+    auto_connect: false
     on_connect:
       then:
+        - lambda: |-
+            id(dot_connecting) = false;
+            id(dot_release) = false;
         - binary_sensor.template.publish:
-            id: futula_connected
+            id: dot_connected
             state: ON
-        - logger.log: "Futula connected"
+        # FFF2 — запись команд. Запомнить до освобождения кэша GATT
+        - lambda: |-
+            id(dot_tare_handle) = 0;
+            id(dot_tare_props) = 0;
+            auto *chr = id(dot_scale).get_characteristic(0xFFF0, 0xFFF2);
+            if (chr == nullptr) {
+              ESP_LOGW("grind", "Timemore FFF2 not found, tare unavailable");
+              return;
+            }
+            id(dot_tare_handle) = chr->handle;
+            id(dot_tare_props) = chr->properties;
+            ESP_LOGI("grind", "Timemore FFF2 handle=%u props=0x%02X", chr->handle, chr->properties);
+        # Dot отдаёт поток только сопряжённому клиенту, как приложению Timemore
+        - lambda: |-
+            id(dot_cccd_handle) = 0;
+            auto *ntf = id(dot_scale).get_characteristic(0xFFF0, 0xFFF1);
+            if (ntf != nullptr) {
+              auto *d = ntf->get_descriptor(0x2902);
+              if (d != nullptr)
+                id(dot_cccd_handle) = d->handle;
+            }
+            esp_err_t err = esp_ble_set_encryption(id(dot_scale).get_remote_bda(), ESP_BLE_SEC_ENCRYPT_NO_MITM);
+            ESP_LOGI("scale", "Timemore pairing err=%d cccd=%u", (int) err, id(dot_cccd_handle));
+        - logger.log: "Timemore connected"
+        - script.execute: dot_hello
     on_disconnect:
       then:
+        - lambda: |-
+            id(dot_connecting) = false;
+            id(dot_tare_handle) = 0;
+            id(dot_tare_props) = 0;
+            id(dot_cccd_handle) = 0;
+            if (id(use_dot).state)
+              id(dot_release) = true;
         - binary_sensor.template.publish:
-            id: futula_connected
+            id: dot_connected
             state: OFF
-        - logger.log: "Futula disconnected, will scan again"
-        - script.execute: futula_scan_now
+        - logger.log: "Timemore disconnected"
+        - script.stop: dot_scan_now
+        - script.stop: dot_scan_later
+        - script.stop: dot_hello
+        - esp32_ble_tracker.stop_scan:
+        - if:
+            condition:
+              switch.is_on: use_dot
+            then:
+              - script.execute: dot_back_later
 
 time:
   - platform: homeassistant
@@ -195,6 +259,42 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  # handle FFF1, снятый в момент подключения, пока кэш GATT ещё жив
+  - id: dot_tare_handle
+    type: uint16_t
+    restore_value: false
+    initial_value: "0"
+  - id: dot_tare_props
+    type: uint8_t
+    restore_value: false
+    initial_value: "0"
+  # скрипт тарирования ставит true только в самом конце; помол ждёт этот флаг
+  - id: dot_tare_done
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # поток, который Dot сам кладёт в кадр веса, г/с
+  - id: dot_flow_gps
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: dot_connecting
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: dot_cccd_handle
+    type: uint16_t
+    restore_value: false
+    initial_value: "0"
+  - id: dot_hello_i
+    type: uint8_t
+    restore_value: false
+    initial_value: "0"
+  # не искать весы: переключатель выключен или идёт пауза после обрыва
+  - id: dot_release
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
 number:
   - platform: template
@@ -260,6 +360,31 @@ button:
     icon: mdi:gesture-tap-button
     on_press:
       - script.execute: grind_button
+
+  - platform: template
+    name: Scale Tare
+    icon: mdi:scale-balance
+    entity_category: config
+    on_press:
+      - script.execute: dot_tare
+
+  # После сброса весов старый ключ сопряжения не подходит — забыть его и сопрячь заново
+  - platform: template
+    name: Timemore Unpair
+    icon: mdi:bluetooth-off
+    entity_category: config
+    on_press:
+      - lambda: |-
+          int n = esp_ble_get_bond_device_num();
+          if (n > 0) {
+            std::vector<esp_ble_bond_dev_t> list(n);
+            esp_ble_get_bond_device_list(&n, list.data());
+            for (int i = 0; i < n; i++)
+              esp_ble_remove_bond_device(list[i].bd_addr);
+          }
+          ESP_LOGI("scale", "Timemore bonds removed: %d", n);
+          if (id(dot_scale).connected())
+            id(dot_scale).disconnect();
 
 light:
   - platform: status_led
@@ -352,29 +477,60 @@ sensor:
     update_interval: never
 
   - platform: ble_client
-    ble_client_id: futula_scale
+    ble_client_id: dot_scale
     type: characteristic
     # тот же вес публикуется в Scale Weight; в HA отдельно не показываем
     internal: true
-    id: futula_weight
+    id: dot_weight
     service_uuid: "0000fff0-0000-1000-8000-00805f9b34fb"
-    characteristic_uuid: "0000fff4-0000-1000-8000-00805f9b34fb"
+    characteristic_uuid: "0000fff1-0000-1000-8000-00805f9b34fb"
     notify: true
-    # С update_interval: never вес переставал приходить. Опрос возвращает
-    # status=2 (FFF4 не читается), эта ошибка скрыта в logger.
+    # Уведомления каждые 100 мс. Опрос FFF1 не обязателен и может дать status=2.
     update_interval: 60s
     unit_of_measurement: g
     device_class: weight
     accuracy_decimals: 1
     lambda: |-
-      if (x.size() < 6)
-        return NAN;
-      uint16_t raw = (uint16_t) x[3] | ((uint16_t) x[4] << 8);
-      float grams = raw / 10.0f;
-      if (x[5] > 0)
-        grams = -grams;
-      if (id(use_futula).state)
+      static uint8_t buf[40];
+      static uint8_t len = 0;
+      for (size_t i = 0; i < x.size() && len < sizeof(buf); i++)
+        buf[len++] = x[i];
+      float grams = NAN;
+      while (len >= 6) {
+        size_t start = 0;
+        while (start + 1 < len && !(buf[start] == 0xA5 && buf[start + 1] == 0x5A))
+          start++;
+        if (start > 0) {
+          memmove(buf, buf + start, len - start);
+          len -= start;
+        }
+        if (len < 6 || buf[0] != 0xA5 || buf[1] != 0x5A)
+          break;
+        uint16_t plen = ((uint16_t) buf[4] << 8) | buf[5];
+        if (plen > 24) {
+          memmove(buf, buf + 1, --len);
+          continue;
+        }
+        size_t full = 8u + plen;
+        if (len < full)
+          break;
+        if (buf[2] == 0x01 && buf[3] == 0x01 && plen >= 9) {
+          int32_t raw = (int32_t) (((uint32_t) buf[6] << 24) | ((uint32_t) buf[7] << 16) |
+                                   ((uint32_t) buf[8] << 8) | buf[9]);
+          grams = raw / 10.0f;
+          int16_t flow_raw = (int16_t) (((uint16_t) buf[10] << 8) | buf[11]);
+          float flow = flow_raw / 10.0f;
+          if (flow < 0.0f || flow > 20.0f)
+            flow = 0.0f;
+          id(dot_flow_gps) = flow;
+        }
+        memmove(buf, buf + full, len - full);
+        len = (uint8_t) (len - full);
+      }
+      if (!isnan(grams) && id(use_dot).state)
         id(scale_weight).publish_state(grams);
+      if (isnan(grams))
+        return id(dot_weight).has_state() ? id(dot_weight).state : NAN;
       return grams;
 
   - platform: template
@@ -436,7 +592,7 @@ switch:
           condition:
             or:
               - switch.is_on: grind_by_weight
-              - switch.is_on: use_futula
+              - switch.is_on: use_dot
           then:
             - lambda: id(need_profile_fetch) = true;
             - script.execute: gaggiuino_fetch_status
@@ -459,8 +615,11 @@ switch:
             - script.execute: grind_cancel
 
   - platform: gpio
+    # Реле не отдаём в HA: выключатель включает мотор в обход тарирования и остановки по весу.
+    # Помол только с кнопки Grinder Button и с физической кнопки.
     name: Grinder
     id: relay_grinder
+    internal: true
     icon: mdi:coffee
     pin: GPIO14
     restore_mode: ALWAYS_OFF
@@ -496,27 +655,45 @@ switch:
             - lambda: id(need_profile_fetch) = true;
             - script.execute: gaggiuino_fetch_status
 
-  # ON = вес с Futula по BLE, OFF = вес из Gaggiuino
+  # ON = вес с Timemore по BLE, OFF = вес из Gaggiuino
   - platform: template
-    name: Futula Scale
-    id: use_futula
+    name: Timemore Scale
+    id: use_dot
     icon: mdi:scale-bathroom
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
     on_turn_on:
-      # доза с Gaggiuino только пока кофеварка включена; вес Futula идёт и без неё
+      # доза с Gaggiuino только пока кофеварка включена; вес Timemore идёт и без неё
       - if:
           condition:
             switch.is_on: relay_coffee
           then:
             - lambda: id(need_profile_fetch) = true;
             - script.execute: gaggiuino_fetch_status
-      - script.execute: futula_scan_now
+      - lambda: id(dot_release) = false;
+      - script.stop: dot_back_later
+      - script.execute: dot_scan_now
     on_turn_off:
-      - script.stop: futula_scan_now
-      - script.stop: futula_scan_later
+      - lambda: |-
+          id(dot_release) = true;
+          id(dot_connecting) = false;
+      - script.stop: dot_scan_now
+      - script.stop: dot_scan_later
+      - script.stop: dot_back_later
+      - script.stop: dot_hello
       - esp32_ble_tracker.stop_scan:
-      - ble_client.disconnect: futula_scale
+      - lambda: |-
+          ESP_LOGI("scale", "Timemore Scale off, disconnect");
+          id(dot_scale).unconditional_disconnect();
+
+  # Перед помолом обнулить Timemore и подождать, пока вес осядет на нуле
+  - platform: template
+    name: Grind Auto Tare
+    id: grind_auto_tare
+    icon: mdi:scale-balance
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
 
 script:
   - id: coffee_idle_timer
@@ -546,25 +723,137 @@ script:
       - switch.turn_off: relay_grinder
       - lambda: id(grind_stopping) = false;
 
-  # Пока «Futula Scale» включена, ищем весы пачками по 15 с.
+  # Пока «Timemore Scale» включена, ищем весы пачками по 15 с.
   # on_turn_on после перезагрузки не вызывается, поэтому тот же скрипт стартует с on_boot.
-  - id: futula_scan_now
+  - id: dot_scan_now
     mode: single
     then:
       - if:
           condition:
             and:
-              - switch.is_on: use_futula
-              - binary_sensor.is_off: futula_connected
+              - switch.is_on: use_dot
+              - binary_sensor.is_off: dot_connected
+              - lambda: return !id(dot_connecting) && !id(dot_release);
           then:
-            - logger.log: "Futula: scanning"
+            - logger.log: "Timemore: scanning"
             - esp32_ble_tracker.start_scan:
 
-  - id: futula_scan_later
+  - id: dot_scan_later
     mode: restart
     then:
       - delay: 4s
-      - script.execute: futula_scan_now
+      # поиск сервисов Dot идёт ~5 с; повторный connect в это время рвёт связь
+      - lambda: |-
+          auto st = id(dot_scale).state();
+          if (st != esp32_ble_tracker::ClientState::CONNECTING &&
+              st != esp32_ble_tracker::ClientState::CONNECTED &&
+              st != esp32_ble_tracker::ClientState::ESTABLISHED)
+            id(dot_connecting) = false;
+      - script.execute: dot_scan_now
+
+  # После обрыва не подключаться сразу.
+  - id: dot_back_later
+    mode: restart
+    then:
+      - delay: 12s
+      - lambda: id(dot_release) = false;
+      - script.execute: dot_scan_now
+
+  # После подключения разбудить поток кадров: граммы и запросы, как в приложении Timemore.
+  - id: dot_hello
+    mode: single
+    then:
+      # дать сопряжению закончиться, потом заново включить уведомления уже по шифрованной связи
+      - delay: 1500ms
+      - lambda: |-
+          if (!id(dot_scale).connected() || id(dot_tare_handle) == 0) {
+            id(dot_hello_i) = 6;
+            return;
+          }
+          if (id(dot_cccd_handle) != 0) {
+            uint8_t on[2] = {0x01, 0x00};
+            esp_ble_gattc_write_char_descr(
+                (esp_gatt_if_t) id(dot_scale).get_gattc_if(), id(dot_scale).get_conn_id(),
+                id(dot_cccd_handle), sizeof(on), on, ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+          }
+      - delay: 200ms
+      - lambda: |-
+          if (!id(dot_scale).connected() || id(dot_tare_handle) == 0) {
+            id(dot_hello_i) = 6;
+            return;
+          }
+          uint8_t cmd[9] = {0xA5, 0x5A, 0x03, 0x06, 0x00, 0x01, 0x00, 0xE8, 0xA7};
+          esp_ble_gattc_write_char(
+              (esp_gatt_if_t) id(dot_scale).get_gattc_if(), id(dot_scale).get_conn_id(),
+              id(dot_tare_handle), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+          id(dot_hello_i) = 0;
+      - while:
+          condition:
+            lambda: return id(dot_hello_i) < 6;
+          then:
+            - delay: 160ms
+            - lambda: |-
+                if (!id(dot_scale).connected() || id(dot_tare_handle) == 0) {
+                  id(dot_hello_i) = 6;
+                  return;
+                }
+                static const uint8_t q[6][8] = {
+                    {0xA5, 0x5A, 0x02, 0x13, 0x00, 0x00, 0x9E, 0xB0},
+                    {0xA5, 0x5A, 0x02, 0x08, 0x00, 0x00, 0x99, 0xC0},
+                    {0xA5, 0x5A, 0x02, 0x05, 0x00, 0x00, 0x5A, 0x51},
+                    {0xA5, 0x5A, 0x02, 0x02, 0x00, 0x00, 0x9B, 0xE0},
+                    {0xA5, 0x5A, 0x02, 0x06, 0x00, 0x00, 0x5A, 0xA1},
+                    {0xA5, 0x5A, 0x02, 0x0C, 0x00, 0x00, 0x58, 0x81},
+                };
+                uint8_t i = id(dot_hello_i);
+                esp_ble_gattc_write_char(
+                    (esp_gatt_if_t) id(dot_scale).get_gattc_if(), id(dot_scale).get_conn_id(),
+                    id(dot_tare_handle), 8, (uint8_t *) q[i], ESP_GATT_WRITE_TYPE_NO_RSP,
+                    ESP_GATT_AUTH_REQ_NONE);
+                id(dot_hello_i) = i + 1;
+
+  # Обнуление Timemore. Кнопка Scale Tare и Grind Auto Tare вызывают один скрипт.
+  # Пишем сами: ble_write ждёт ответ весов и может зависнуть, не включив мотор.
+  - id: dot_tare
+    mode: single
+    then:
+      - lambda: |-
+          float w = id(scale_weight).has_state() ? id(scale_weight).state : -1.0f;
+          bool gatt = id(dot_scale).connected();
+          ESP_LOGI("grind", "tare request weight=%.2f dot_switch=%d link=%d gatt=%d handle=%u props=0x%02X",
+                   w, (int) id(use_dot).state, (int) id(dot_connected).state,
+                   (int) gatt, id(dot_tare_handle), id(dot_tare_props));
+          if (!gatt || id(dot_tare_handle) == 0)
+            return;
+          // A5 5A 03 0D 00 00 64 D1 — тара Dot, запись без ответа на FFF2
+          uint8_t cmd[8] = {0xA5, 0x5A, 0x03, 0x0D, 0x00, 0x00, 0x64, 0xD1};
+          esp_err_t err = esp_ble_gattc_write_char(
+              (esp_gatt_if_t) id(dot_scale).get_gattc_if(), id(dot_scale).get_conn_id(),
+              id(dot_tare_handle), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGI("grind", "tare write err=%d", (int) err);
+      - delay: 400ms
+      - lambda: |-
+          float w = id(scale_weight).has_state() ? id(scale_weight).state : -1.0f;
+          if (!id(dot_scale).connected() || id(dot_tare_handle) == 0 || fabsf(w) < 1.0f)
+            return;
+          uint8_t cmd[8] = {0xA5, 0x5A, 0x03, 0x0D, 0x00, 0x00, 0x64, 0xD1};
+          esp_err_t err = esp_ble_gattc_write_char(
+              (esp_gatt_if_t) id(dot_scale).get_gattc_if(), id(dot_scale).get_conn_id(),
+              id(dot_tare_handle), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGI("grind", "tare write again err=%d weight=%.2f", (int) err, w);
+      - wait_until:
+          condition:
+            lambda: |-
+              return id(scale_weight).has_state() && fabsf(id(scale_weight).state) < 1.0f;
+          timeout: 2.5s
+      - delay: 400ms
+      - lambda: |-
+          float w = id(scale_weight).has_state() ? id(scale_weight).state : -1.0f;
+          if (fabsf(w) < 1.0f)
+            ESP_LOGI("grind", "Timemore tare ok, weight=%.2f", w);
+          else
+            ESP_LOGW("grind", "Timemore tare failed, weight is still %.2f", w);
+          id(dot_tare_done) = true;
 
   - id: gaggiuino_fetch_status
     mode: single
@@ -605,7 +894,7 @@ script:
                           else
                             w = obj["weight"].as<float>();
                         }
-                        if (!isnan(w) && !id(use_futula).state)
+                        if (!isnan(w) && !id(use_dot).state)
                           id(scale_weight).publish_state(w);
                         // profileId бывает и числом, и строкой "7".
                         // is<const char*>() для строки из JSON часто false, as<int>() тогда даёт 0.
@@ -627,7 +916,9 @@ script:
                           ESP_LOGW("gaggiuino", "profileId unparsed: %s", raw != nullptr ? raw : "(null)");
                         }
                         if (!obj["profileName"].isNull()) {
-                          id(gaggiuino_profile_name).publish_state(obj["profileName"].as<std::string>());
+                          std::string pname = obj["profileName"].as<std::string>();
+                          if (!id(gaggiuino_profile_name).has_state() || id(gaggiuino_profile_name).state != pname)
+                            id(gaggiuino_profile_name).publish_state(pname);
                         }
                   else:
                     - logger.log:
@@ -775,20 +1066,52 @@ script:
             lambda: |-
               if (!(id(grind_target_g) > 0.0f) || isnan(id(grind_target_g)))
                 return false;
-              if (id(use_futula).state && !id(futula_weight).has_state())
+              if (id(use_dot).state && !id(dot_weight).has_state())
                 return false;
               return true;
           then:
+            - if:
+                condition:
+                  and:
+                    - switch.is_on: grind_auto_tare
+                    - switch.is_on: use_dot
+                then:
+                  # script.wait сразу после execute часто видит «скрипт ещё не запущен»
+                  # и отпускает помол до команды тары. Ждём флаг, который ставится в конце скрипта.
+                  - lambda: id(dot_tare_done) = false;
+                  - script.execute: dot_tare
+                  - wait_until:
+                      condition:
+                        lambda: return id(dot_tare_done);
+                      timeout: 6s
+                else:
+                  - lambda: |-
+                      ESP_LOGI("grind", "auto tare off: switch=%d scale=%d",
+                               id(grind_auto_tare).state, id(use_dot).state);
             - lambda: |-
-                id(grind_start_weight) = id(scale_weight).has_state() ? id(scale_weight).state : 0.0f;
+                float w = id(scale_weight).has_state() ? id(scale_weight).state : 0.0f;
+                // автотарирование включено, а ноль не пришёл — мотор не трогаем,
+                // иначе поздний ноль уведёт дельту в минус и помол не остановится
+                if (id(grind_auto_tare).state && id(use_dot).state && fabsf(w) >= 1.0f) {
+                  id(grind_stopping) = true;
+                  ESP_LOGW("grind", "abort grind, tare failed weight=%.2f", w);
+                  return;
+                }
+                id(grind_stopping) = false;
+                id(grind_start_weight) = w;
                 id(grind_prev_g) = 0.0f;
                 id(grind_prev_ms) = millis();
                 // поток прошлого помола не используем: он был завышен скачками по 0,1 г
                 id(grind_rate_gps) = 0.0f;
+                id(dot_flow_gps) = 0.0f;
                 ESP_LOGI("grind", "start_weight=%.2f target=%.2f lead=%.2fs early=%.2fg",
                          id(grind_start_weight), id(grind_target_g), id(grind_lead_s),
                          id(grind_stop_early).state);
-            - switch.turn_on: relay_grinder
+            - if:
+                condition:
+                  lambda: return !id(grind_stopping);
+                then:
+                  - switch.turn_on: relay_grinder
             - while:
                 condition:
                   and:
@@ -812,30 +1135,38 @@ script:
                 then:
                   - if:
                       condition:
-                        switch.is_on: use_futula
+                        switch.is_on: use_dot
                       then:
                         - delay: 50ms
                       else:
+                        # запрос блокирует loop; 50 мс между запросами хватает Wi-Fi и API
                         - script.execute: gaggiuino_fetch_status
                         - delay: 50ms
                         - script.wait: gaggiuino_fetch_status
-                        - delay: 400ms
                   - lambda: |-
+                      float live = id(dot_flow_gps);
+                      // Dot считает поток сам: int16, единица 100 мг/с
+                      if (live >= 0.4f && live <= 3.0f) {
+                        float r = id(grind_rate_gps);
+                        id(grind_rate_gps) = (r < 0.4f) ? live : (r * 0.7f + live * 0.3f);
+                        id(grind_flow).publish_state(id(grind_rate_gps));
+                      }
                       float delta = id(scale_weight).state - id(grind_start_weight);
                       uint32_t now = millis();
-                      // первый грамм — разгон, в поток не берём
+                      // первый грамм — разгон, в запасной расчёт по весу не берём
                       if (delta <= 1.0f) {
                         id(grind_prev_g) = delta;
                         id(grind_prev_ms) = now;
                         return;
                       }
                       float dt = (now - id(grind_prev_ms)) / 1000.0f;
-                      // окно 0,7 с включает и пустые шаги между скачками 0,1 г
                       if (dt < 0.7f)
                         return;
                       float inst = (delta - id(grind_prev_g)) / dt;
                       id(grind_prev_g) = delta;
                       id(grind_prev_ms) = now;
+                      if (live >= 0.4f)
+                        return;
                       if (inst >= 0.4f && inst <= 3.0f) {
                         float r = id(grind_rate_gps);
                         id(grind_rate_gps) = (r < 0.4f) ? inst : (r * 0.6f + inst * 0.4f);
@@ -895,6 +1226,12 @@ script:
                       auto call = id(grind_stop_early).make_call();
                       call.set_value(grams);
                       call.perform();
+            - if:
+                condition:
+                  lambda: return id(grind_stopping);
+                then:
+                  - script.stop: grind_weight_watchdog
+                  - lambda: id(grind_stopping) = false;
           else:
             - logger.log: "No grind target weight — abort"
 
@@ -929,7 +1266,7 @@ script:
                     - switch.is_on: relay_coffee
                     - or:
                         - switch.is_on: grind_by_weight
-                        - switch.is_on: use_futula
+                        - switch.is_on: use_dot
                 then:
                   - script.execute: grind_weight
                   - script.execute: grind_weight_watchdog
@@ -946,7 +1283,7 @@ interval:
               - switch.is_on: relay_coffee
               - or:
                   - switch.is_on: grind_by_weight
-                  - switch.is_on: use_futula
+                  - switch.is_on: use_dot
               - not:
                   script.is_running: grind_weight
               - not:
@@ -968,8 +1305,8 @@ interval:
 
 binary_sensor:
   - platform: template
-    id: futula_connected
-    name: Futula Connected
+    id: dot_connected
+    name: Timemore Connected
     device_class: connectivity
     entity_category: diagnostic
 
