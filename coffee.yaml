@@ -1,12 +1,12 @@
 # Sonoff Dual R3 v1 (CSE7761)
 # Кофеварка: реле всегда ON после старта (управление из HA), физ. кнопок нет
-# S2 — кнопка кофемолки: по времени ИЛИ по весу с Gaggiuino
+# S2 — кнопка кофемолки: по времени ИЛИ по весу Timemore
 #
-# Подставьте IP/hostname Gaggiuino ниже.
+# Подставьте IP/hostname Gaggiuino ниже. С Gaggiuino берётся только профиль и доза.
 # Целевой вес помола: recipe.coffeeIn (dose), не globalStopConditions.weight.
 # Остановка по весу: прирост на весах от момента старта (можно не тарить до 0).
-# Timemore Scale: переключатель «Timemore Scale». Пока он включён, вес берётся
-# с Black Mirror Dot (имя TIMEMORE_Dot). Доза по-прежнему из профиля Gaggiuino.
+# Timemore Scale: переключатель «Timemore Scale». Пока он включён и весы подключены,
+# помол идёт по весу Black Mirror Dot (имя TIMEMORE_Dot).
 # Телефон к весам в этот момент не подключать: Dot держит одно соединение.
 
 substitutions:
@@ -135,6 +135,9 @@ esp32_ble_tracker:
     continuous: false
     duration: 15s
     active: true
+    # по умолчанию при Wi-Fi скан слушает всё время и душит соединение с Gaggiuino
+    interval: 320ms
+    window: 30ms
   on_scan_end:
     - script.execute: dot_scan_later
   on_ble_advertise:
@@ -320,6 +323,16 @@ globals:
     initial_value: "false"
   - id: decent_conn
     type: uint16_t
+    restore_value: false
+    initial_value: "0"
+  # сервер сам включает рекламу при старте; дальше её держим только пока Timemore отдаёт вес
+  - id: decent_adv
+    type: bool
+    restore_value: false
+    initial_value: "true"
+  # время последнего кадра веса Timemore
+  - id: dot_last_ms
+    type: uint32_t
     restore_value: false
     initial_value: "0"
   - id: dot_cccd_handle
@@ -538,29 +551,6 @@ sensor:
     unit_of_measurement: g
     device_class: weight
     accuracy_decimals: 1
-    # тот же вес отдаём Gaggiuino кадром Decent Scale: 03 CE, int16 BE в десятых грамма, 00 00, XOR
-    # Шлём напрямую по соединению: штатный notify ждёт подписку, которую Gaggiuino пишет без ответа.
-    # FFF4 — первая характеристика сервиса, её значение лежит на handle сервиса + 2.
-    on_value:
-      - lambda: |-
-          if (!id(decent_client) || isnan(x))
-            return;
-          long w = lroundf(x * 10.0f);
-          if (w > 32767) w = 32767;
-          if (w < -32768) w = -32768;
-          uint16_t u = (uint16_t) (int16_t) w;
-          uint8_t f[7] = {0x03, 0xCE, (uint8_t) (u >> 8), (uint8_t) (u & 0xFF), 0x00, 0x00, 0x00};
-          for (int i = 0; i < 6; i++)
-            f[6] ^= f[i];
-          id(decent_weight)->set_value(f, sizeof(f));
-          uint16_t handle = id(decent_weight)->get_service()->get_handle() + 2;
-          esp_err_t err = esp_ble_gatts_send_indicate(id(decent_server)->get_gatts_if(), id(decent_conn),
-                                                      handle, sizeof(f), f, false);
-          static uint32_t last_log = 0;
-          if (err != ESP_OK && millis() - last_log > 5000) {
-            last_log = millis();
-            ESP_LOGW("decent", "tx failed err=%d conn=%u handle=%u", (int) err, id(decent_conn), handle);
-          }
     lambda: |-
       static uint8_t buf[40];
       static uint8_t len = 0;
@@ -589,6 +579,7 @@ sensor:
           int32_t raw = (int32_t) (((uint32_t) buf[6] << 24) | ((uint32_t) buf[7] << 16) |
                                    ((uint32_t) buf[8] << 8) | buf[9]);
           grams = raw / 10.0f;
+          id(dot_last_ms) = millis();
           int16_t flow_raw = (int16_t) (((uint16_t) buf[10] << 8) | buf[11]);
           float flow = flow_raw / 10.0f;
           if (flow < 0.0f || flow > 20.0f)
@@ -664,9 +655,7 @@ switch:
       - script.execute: coffee_idle_timer
       - if:
           condition:
-            or:
-              - switch.is_on: grind_by_weight
-              - switch.is_on: use_dot
+            switch.is_on: use_dot
           then:
             - lambda: id(need_profile_fetch) = true;
             - script.execute: gaggiuino_fetch_status
@@ -681,7 +670,6 @@ switch:
       - script.stop: gaggiuino_fetch_profile_target
       - lambda: id(need_profile_fetch) = false;
       # помол по весу только пока кофеварка включена
-      - switch.turn_off: grind_by_weight
       - if:
           condition:
             script.is_running: grind_weight
@@ -711,25 +699,7 @@ switch:
             - script.stop: grind_weight_watchdog
             - script.stop: grind_prepare_target
 
-  # ON = вес и остановка помола по Gaggiuino, OFF = помол по таймеру
-  - platform: template
-    name: Gaggiuino Scale
-    id: grind_by_weight
-    icon: mdi:weight
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
-    on_turn_on:
-      - if:
-          condition:
-            switch.is_off: relay_coffee
-          then:
-            - switch.turn_off: grind_by_weight
-          else:
-            # один раз подтянуть dose; фоновый опрос только пока режим веса включён
-            - lambda: id(need_profile_fetch) = true;
-            - script.execute: gaggiuino_fetch_status
-
-  # ON = вес с Timemore по BLE, OFF = вес из Gaggiuino
+  # ON = помол по весу Timemore, OFF = помол по таймеру
   - platform: template
     name: Timemore Scale
     id: use_dot
@@ -961,15 +931,6 @@ script:
                           return;
                         }
                         JsonObject obj = doc.is<JsonArray>() ? doc[0].as<JsonObject>() : doc.as<JsonObject>();
-                        float w = NAN;
-                        if (!obj["weight"].isNull()) {
-                          if (obj["weight"].is<const char *>())
-                            w = strtof(obj["weight"].as<const char *>(), nullptr);
-                          else
-                            w = obj["weight"].as<float>();
-                        }
-                        if (!isnan(w) && !id(use_dot).state)
-                          id(scale_weight).publish_state(w);
                         // profileId бывает и числом, и строкой "7".
                         // is<const char*>() для строки из JSON часто false, as<int>() тогда даёт 0.
                         int pid = 0;
@@ -1140,8 +1101,10 @@ script:
             lambda: |-
               if (!(id(grind_target_g) > 0.0f) || isnan(id(grind_target_g)))
                 return false;
-              if (id(use_dot).state && !id(dot_weight).has_state())
+              if (!id(dot_connected).state || !id(scale_weight).has_state()) {
+                ESP_LOGW("grind", "Timemore not connected, no weight");
                 return false;
+              }
               return true;
           then:
             - if:
@@ -1207,16 +1170,7 @@ script:
                         float delta = id(scale_weight).state - id(grind_start_weight);
                         return !id(grind_stopping) && delta < (id(grind_target_g) - early);
                 then:
-                  - if:
-                      condition:
-                        switch.is_on: use_dot
-                      then:
-                        - delay: 50ms
-                      else:
-                        # запрос блокирует loop; 50 мс между запросами хватает Wi-Fi и API
-                        - script.execute: gaggiuino_fetch_status
-                        - delay: 50ms
-                        - script.wait: gaggiuino_fetch_status
+                  - delay: 50ms
                   - lambda: |-
                       float live = id(dot_flow_gps);
                       // Dot считает поток сам: int16, единица 100 мг/с
@@ -1338,26 +1292,76 @@ script:
                 condition:
                   and:
                     - switch.is_on: relay_coffee
-                    - or:
-                        - switch.is_on: grind_by_weight
-                        - switch.is_on: use_dot
+                    - switch.is_on: use_dot
+                    - binary_sensor.is_on: dot_connected
                 then:
                   - script.execute: grind_weight
                   - script.execute: grind_weight_watchdog
                 else:
+                  # без кофеварки или без подключённых весов — по таймеру Grind Time
                   - script.execute: grind_time
 
 interval:
-  # HTTP только если нужен режим веса — иначе mDNS к мёртвому хосту роняет Task WDT
+  # «Decent Scale» виден Gaggiuino, только пока Timemore подключены и шлют вес.
+  # Если подключиться к пустому мосту, Gaggiuino остаётся на нуле до своей перезагрузки.
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto *srv = id(decent_server);
+          if (!srv->is_running())
+            return;
+          bool live = id(dot_connected).state && id(dot_last_ms) != 0 &&
+                      millis() - id(dot_last_ms) < 3000;
+          if (live && !id(decent_adv)) {
+            esp32_ble::global_ble->advertising_start();
+            id(decent_adv) = true;
+            ESP_LOGI("decent", "Timemore live, advertising Decent Scale");
+          } else if (!live) {
+            if (id(decent_adv)) {
+              esp32_ble::global_ble->advertising_stop();
+              id(decent_adv) = false;
+              ESP_LOGI("decent", "Timemore gone, stop advertising");
+            }
+            const uint16_t *clients = srv->get_clients();
+            uint8_t n = srv->get_client_count();
+            for (uint8_t i = 0; i < n; i++)
+              esp_ble_gatts_close(srv->get_gatts_if(), clients[i]);
+            if (n > 0)
+              ESP_LOGI("decent", "drop %u Gaggiuino client(s) without Timemore", n);
+          }
+  # Настоящие Decent шлют вес 10 раз в секунду сразу после подключения.
+  # Если молчать, пока Timemore выключены, Gaggiuino остаётся на нуле до своей перезагрузки.
+  - interval: 100ms
+    then:
+      - lambda: |-
+          if (!id(decent_client))
+            return;
+          float grams = 0.0f;
+          if (id(dot_connected).state && id(scale_weight).has_state() && !isnan(id(scale_weight).state))
+            grams = id(scale_weight).state;
+          long w = lroundf(grams * 10.0f);
+          if (w > 32767) w = 32767;
+          if (w < -32768) w = -32768;
+          uint16_t u = (uint16_t) (int16_t) w;
+          uint8_t f[7] = {0x03, 0xCE, (uint8_t) (u >> 8), (uint8_t) (u & 0xFF), 0x00, 0x00, 0x00};
+          for (int i = 0; i < 6; i++)
+            f[6] ^= f[i];
+          id(decent_weight)->set_value(f, sizeof(f));
+          // FFF4 — первая характеристика сервиса, её значение лежит на handle сервиса + 2
+          uint16_t handle = id(decent_weight)->get_service()->get_handle() + 2;
+          auto *srv = id(decent_server);
+          const uint16_t *clients = srv->get_clients();
+          uint8_t n = srv->get_client_count();
+          for (uint8_t i = 0; i < n; i++)
+            esp_ble_gatts_send_indicate(srv->get_gatts_if(), clients[i], handle, sizeof(f), f, false);
+  # HTTP только если нужен профиль — иначе запрос к мёртвому хосту роняет Task WDT
   - interval: 10s
     then:
       - if:
           condition:
             and:
               - switch.is_on: relay_coffee
-              - or:
-                  - switch.is_on: grind_by_weight
-                  - switch.is_on: use_dot
+              - switch.is_on: use_dot
               - not:
                   script.is_running: grind_weight
               - not:
